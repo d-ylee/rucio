@@ -19,14 +19,38 @@ from urllib.parse import urlencode
 import pytest
 
 from rucio.common.config import config_get_bool
-from rucio.common.exception import IdentityError, IdentityNotFound
+from rucio.common.exception import IdentityError, IdentityNotFound, Duplicate, DatabaseException
 from rucio.common.types import InternalAccount
-from rucio.common.utils import generate_uuid as uuid
+from rucio.common.utils import generate_uuid as uuid, ssh_sign
 from rucio.core.account import add_account, del_account
 from rucio.core.identity import add_account_identity, add_identity, del_account_identity, del_identity, list_identities, verify_identity
 from rucio.db.sqla.constants import AccountType, IdentityType
+from rucio.gateway.authentication import get_ssh_challenge_token
 from rucio.tests.common import account_name_generator, auth, hdrdict, headers, rfc2253_dn_generator
 from rucio.tests.common_server import get_vo
+
+PUBLIC_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDrZmDV3wJnXpm1dTa851KKfyY"\
+             "aovD7GMU7KbDXo6NyFotFt4Sar223zJrCK+x3Qu9zEByMBbQ90eC/BTb5aNRmKL"\
+             "Mkw4D7vshzQmaaoG+rTai1XU9qAMbi0dRr7z6WtOvjd0jBS9PFD913pfzM3NOKU"\
+             "6DIUiMTiYBPbmhos+8D0w== test_key"
+
+PRIVATE_KEY = """-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAlwAAAAdzc2gtcn
+NhAAAAAwEAAQAAAIEA62Zg1d8CZ16ZtXU2vOdSin8mGqLw+xjFOymw16OjchaLRbeEmq9t
+t8yawivsd0LvcxAcjAW0PdHgvwU2+WjUZiizJMOA+77Ic0JmmqBvq02otV1PagDG4tHUa+
+8+lrTr43dIwUvTxQ/dd6X8zNzTilOgyFIjE4mAT25oaLPvA9MAAAIAzIGi5cyBouUAAAAH
+c3NoLXJzYQAAAIEA62Zg1d8CZ16ZtXU2vOdSin8mGqLw+xjFOymw16OjchaLRbeEmq9tt8
+yawivsd0LvcxAcjAW0PdHgvwU2+WjUZiizJMOA+77Ic0JmmqBvq02otV1PagDG4tHUa+8+
+lrTr43dIwUvTxQ/dd6X8zNzTilOgyFIjE4mAT25oaLPvA9MAAAADAQABAAAAgQCejydK6B
+xGZIJEp99m/qmqgFq6Nmb7u4OehkaH+cFuZ6EIJMU9LE1LMJZNlCiDbKK9bmzMJEt0GJq6
+EFknRmVJ3/hv32E+jaeL1Gx1DdMdejOmdLb1+kd8bMZq0Ig7SJd0WGLAoGfC17Iv3QHQQX
+nAlqX+x7jYfkv3cPm5wLJdAQAAAEEA9KlaQsLcrV7c3OmpLph4NcKhgKX07gLJwbdTWc5U
+ZuAYZBu0YWZUDBnDwEqMl2qgxCwZXIojDAI9Xfy/ZQTi3wAAAEEA+q4f8C3OW7bNLqbPoh
+cHdVAZOY4RPfPPA+RuuSmGuqcsxWLYm0u/ea5fJty4hJGF8xz5VC6Ka5dvf1tJLuxqeQAA
+AEEA8GU9eSEVjAunxUvBAXQh3aDjKoswk7QMK9JYkP8A2ThkBbyQ/MD5b0bl7qVWe6UCVV
+ecQCk8zea1FXVakInNqwAAAAh0ZXN0X2tleQE=
+-----END OPENSSH PRIVATE KEY-----
+"""
 
 
 @pytest.mark.noparallel(reason='adds/removes entities with non-unique names')
@@ -192,3 +216,155 @@ class TestListAccountsByIdentity:
         response = rest_client.get(f'/identities/accounts?{query_string}', headers=headers(auth(auth_token)))
         assert response.status_code == 400
         assert 'Invalid identity type' in response.get_data(as_text=True)
+
+
+def test_identity_mapped_to_multiple_accounts_x509(vo, rest_client):
+    """AUTHENTICATION (REST): Test authenticating with same X509 identity for different accounts returns correct account info."""
+    from rucio.common.types import InternalAccount
+    from rucio.tests.common import rfc2253_dn_generator
+
+    account1 = InternalAccount('test_account1_x509')
+    account2 = InternalAccount('test_account2_x509')
+    dn = rfc2253_dn_generator()
+    email = 'email@example.com'
+
+    add_account(account1, AccountType.USER, email)
+
+    add_account(account2, AccountType.USER, email)
+
+    add_identity(dn, IdentityType.X509, email=email)
+    add_account_identity(dn, IdentityType.X509, account1, email=email)
+    add_account_identity(dn, IdentityType.X509, account2, email=email)
+
+    # get rucio token for account1
+    headers_dict = {'X-Rucio-Account': account1}
+
+    response = rest_client.get('/auth/x509',
+                               headers=headers(hdrdict(headers_dict)),
+                               environ_base={'SSL_CLIENT_S_DN': dn})
+
+    assert response.status_code == 200
+    assert response.headers.get('X-Rucio-Auth-Token') is not None
+
+    # get account info for account1
+    headers_dict = {'X-Rucio-Account': account1,
+                    'X-Rucio-Auth-Token': response.headers.get('X-Rucio-Auth-Token')}
+
+    response = rest_client.get(f'/accounts/{str(account1)}',
+                               headers=headers(hdrdict(headers_dict)))
+
+    assert response.status_code == 200
+
+    resp_dict = response.get_json()
+    assert resp_dict['account'] == str(account1)
+
+    # get rucio token for account2 using same x509 dn
+    headers_dict = {'X-Rucio-Account': account2}
+
+    response = rest_client.get('/auth/x509',
+                               headers=headers(hdrdict(headers_dict)),
+                               environ_base={'SSL_CLIENT_S_DN': dn})
+
+    assert response.status_code == 200
+    assert response.headers.get('X-Rucio-Auth-Token') is not None
+
+    # get account info for account2
+    headers_dict = {'X-Rucio-Account': account2,
+                    'X-Rucio-Auth-Token': response.headers.get('X-Rucio-Auth-Token')}
+
+    response = rest_client.get(f'/accounts/{str(account2)}',
+                               headers=headers(hdrdict(headers_dict)))
+
+    assert response.status_code == 200
+    resp_dict = response.get_json()
+    assert resp_dict['account'] == str(account2)
+
+    del_account_identity(dn, IdentityType.X509, account1)
+    del_account_identity(dn, IdentityType.X509, account2)
+    del_identity(dn, IdentityType.X509)
+    del_account(account1)
+    del_account(account2)
+
+
+def test_identity_mapped_to_multiple_accounts_ssh(vo, rest_client):
+    """AUTHENTICATION (REST): Test authenticating with same SSH identity for different accounts returns correct account info."""
+    from rucio.common.types import InternalAccount
+
+    account1 = InternalAccount('test_account1_ssh')
+    account2 = InternalAccount('test_account2_ssh')
+    email = 'email@example.com'
+
+    add_account(account1, AccountType.USER, email)
+
+    add_account(account2, AccountType.USER, email)
+
+    try:
+        add_identity(PUBLIC_KEY, IdentityType.SSH, email=email)
+    except (Duplicate, DatabaseException):
+        pass
+
+    add_account_identity(PUBLIC_KEY, IdentityType.SSH, account1, email=email)
+    add_account_identity(PUBLIC_KEY, IdentityType.SSH, account2, email=email)
+
+    challenge_token = get_ssh_challenge_token(account=str(account1),
+                                              appid='test',
+                                              ip='127.0.0.1', vo=vo).get('token')
+
+    signature = ssh_sign(PRIVATE_KEY, challenge_token)
+
+    # get auth token account1
+    headers_dict = {'X-Rucio-Account': account1,
+                    'X-Rucio-SSH-Signature': signature}
+
+    response = rest_client.get('/auth/ssh',
+                               headers=headers(hdrdict(headers_dict)))
+
+    assert response.status_code == 200
+    assert response.headers.get('X-Rucio-Auth-Token') is not None
+
+    # get account info for account1
+    headers_dict = {'X-Rucio-Account': account1,
+                    'X-Rucio-Auth-Token': response.headers.get('X-Rucio-Auth-Token')}
+
+    response = rest_client.get(f'/accounts/{str(account1)}',
+                               headers=headers(hdrdict(headers_dict)))
+
+    assert response.status_code == 200
+
+    resp_dict = response.get_json()
+    assert resp_dict['account'] == str(account1)
+
+    # get rucio token for account2 using same ssh private key dn
+
+    challenge_token = get_ssh_challenge_token(account=str(account2),
+                                              appid='test',
+                                              ip='127.0.0.1', vo=vo).get('token')
+
+    signature = ssh_sign(PRIVATE_KEY, challenge_token)
+
+    headers_dict = {'X-Rucio-Account': account2,
+                    'X-Rucio-SSH-Signature': signature}
+
+    response = rest_client.get('/auth/ssh',
+                               headers=headers(hdrdict(headers_dict)))
+
+    assert response.status_code == 200
+    assert response.headers.get('X-Rucio-Auth-Token') is not None
+
+    # get account info for account2
+    headers_dict = {'X-Rucio-Account': account2,
+                    'X-Rucio-Auth-Token': response.headers.get('X-Rucio-Auth-Token')}
+
+    response = rest_client.get(f'/accounts/{str(account2)}',
+                               headers=headers(hdrdict(headers_dict)))
+
+    assert response.status_code == 200
+
+    resp_dict = response.get_json()
+    assert resp_dict['account'] == str(account2)
+
+    del_account_identity(PUBLIC_KEY, IdentityType.SSH, account1)
+    del_account_identity(PUBLIC_KEY, IdentityType.SSH, account2)
+    del_identity(PUBLIC_KEY, IdentityType.SSH)
+    del_account(account1)
+    del_account(account2)
