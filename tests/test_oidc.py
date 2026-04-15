@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from dogpile.cache import make_region
+from dogpile.cache.api import NO_VALUE, NoValue
 from jwkest.jwt import JWT
 from oic import rndstr
 from sqlalchemy import select
@@ -27,9 +29,12 @@ from sqlalchemy import select
 from rucio.common.config import config_get_bool
 from rucio.common.exception import CannotAuthenticate, DatabaseException, Duplicate
 from rucio.common.types import InternalAccount
-from rucio.core.account import add_account
-from rucio.core.authentication import redirect_auth_oidc, validate_auth_token
-from rucio.core.identity import add_account_identity
+from rucio.core.account import add_account, del_account
+from rucio.core.authentication import redirect_auth_oidc, validate_auth_token, token_key_generator
+from rucio.core.identity import (add_account_identity,
+                                 add_identity,
+                                 del_account_identity,
+                                 del_identity)
 from rucio.core.oidc import _token_cache_get, _token_cache_set, get_auth_oidc, get_token_oidc, oidc_identity_string
 from rucio.db.sqla import models
 from rucio.db.sqla.constants import AccountType, IdentityType
@@ -795,3 +800,57 @@ def test_token_cache() -> None:
     }])
     _token_cache_set(key, expired_token)
     assert _token_cache_get(key) is None
+
+TOKENREGION2 = make_region(function_key_generator=token_key_generator).configure('dogpile.cache.null')
+
+@patch('rucio.core.authentication.TOKENREGION', TOKENREGION2)
+@patch('rucio.core.oidc.JWS')
+@patch('rucio.core.oidc.OIDC_CLIENTS')
+def test_oidc_identity_mapped_to_multiple_accounts(mock_oidc_clients, mock_jws):
+    """AUTHENTICATION (REST): Test authenticating with same OIDC identity for different accounts returns correct account info."""
+    test_uuid = str(uuid.uuid4())
+    account1 = InternalAccount('test_account1_oidc')
+    account2 = InternalAccount('test_account2_oidc')
+
+    add_account(account1, AccountType.USER, 'email1@example.com')
+    add_account(account2, AccountType.USER, 'email2@example.com')
+
+    identity_subject = 'test_subject_' + test_uuid
+    identity_issuer = 'https://test_issuer/'
+    identity_str = f'SUB={identity_subject}, ISS={identity_issuer}'
+
+    add_identity(identity_str, IdentityType.OIDC, email='test@example.com')
+
+    add_account_identity(identity_str, IdentityType.OIDC, account1, email='email1@example.com')
+    add_account_identity(identity_str, IdentityType.OIDC, account2, email='email2@example.com')
+
+    auth_scope = 'openid profile'
+    audience = 'rucio'
+
+    token = JWT().pack(parts=[{
+        "sub": identity_subject,
+        "iss": identity_issuer,
+        "aud": audience,
+        "scope": auth_scope,
+        "exp": int((datetime.utcnow() + timedelta(minutes=5)).timestamp())}, {}])
+
+    account1_dict = validate_auth_token(token, account=account1)
+    print(account1_dict)
+    assert account1_dict['account'] == account1
+
+    token = JWT().pack(parts=[{
+        "sub": identity_subject,
+        "iss": identity_issuer,
+        "aud": audience,
+        "scope": auth_scope,
+        "exp": int((datetime.utcnow() + timedelta(minutes=5)).timestamp())}, {}])
+
+    account2_dict = validate_auth_token(token, account=account2)
+    print(account2_dict)
+    assert account2_dict['account'] == account2
+
+    del_account_identity(identity_str, IdentityType.OIDC, account1)
+    del_account_identity(identity_str, IdentityType.OIDC, account2)
+    del_identity(identity_str, IdentityType.OIDC)
+    del_account(account1)
+    del_account(account2)
