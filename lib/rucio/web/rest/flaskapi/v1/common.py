@@ -149,13 +149,14 @@ def request_auth_env() -> Optional['ResponseReturnValue']:
     if flask.request.environ.get('REQUEST_METHOD') == HTTPMethod.OPTIONS.value:
         return '', 200
 
+    auth_account = flask.request.headers.get('X-Rucio-Account', default=None)
     auth_token = flask.request.headers.get('X-Rucio-Auth-Token', default=None)
 
     if not auth_token:
         return generate_http_error_flask(400, ValueError.__name__, 'Token must be set.')
 
     try:
-        auth = validate_auth_token(auth_token)
+        auth = validate_auth_token(auth_token, auth_account)
     except CannotAuthenticate:
         return generate_http_error_flask(401, CannotAuthenticate.__name__, 'Cannot authenticate with given credentials')
     except RucioException as error:

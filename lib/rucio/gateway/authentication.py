@@ -329,6 +329,7 @@ def get_auth_token_saml(
 
 def validate_auth_token(
     token: str,
+    account: str = None,
 ) -> dict[str, Any]:
     """
     Validate an authentication token.
@@ -344,8 +345,11 @@ def validate_auth_token(
                            vo: <vo> }
     """
 
+    if account:
+        account = InternalAccount(account)
+
     with db_session(DatabaseOperationType.WRITE) as session:
-        auth = authentication.validate_auth_token(token, session=session)
+        auth = authentication.validate_auth_token(token, account=account, session=session)
         vo = auth['account'].vo
         auth = gateway_update_return_dict(auth, session=session)
         auth['vo'] = vo
