@@ -50,6 +50,7 @@ from rucio.db.sqla.session import read_session, transactional_session
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
+    from rucio.common.types import InternalAccount
 
 # The WLCG Common JWT Profile dictates that the lifetime of access and ID tokens
 # should range from five minutes to six hours.
@@ -852,7 +853,10 @@ def __get_keyvalues_from_claims(token: str, keys=None):
 
 
 @read_session
-def __get_rucio_jwt_dict(jwt: str, account=None, *, session: "Session"):
+def __get_rucio_jwt_dict(jwt: str,
+                         *,
+                         account: Optional["InternalAccount"] = None,
+                         session: "Session"):
     """
     Get a Rucio token dictionary from token claims.
     Check token expiration and find default Rucio
@@ -930,7 +934,10 @@ def __save_validated_token(token, valid_dict, extra_dict=None, *, session: "Sess
 
 
 @transactional_session
-def validate_jwt(json_web_token: str, *, session: "Session") -> dict[str, Any]:
+def validate_jwt(json_web_token: str,
+                 *,
+                 account: Optional["InternalAccount"] = None,
+                 session: "Session") -> dict[str, Any]:
     """
     Verifies signature and validity of a JSON Web Token.
     Gets the issuer public keys from the oidc_client
@@ -957,7 +964,9 @@ def validate_jwt(json_web_token: str, *, session: "Session") -> dict[str, Any]:
     try:
 
         # getting issuer from the token payload
-        token_dict: Optional[dict[str, Any]] = __get_rucio_jwt_dict(json_web_token, session=session)
+        token_dict: Optional[dict[str, Any]] = __get_rucio_jwt_dict(json_web_token,
+                                                                    account=account,
+                                                                    session=session)
         if not token_dict:
             raise CannotAuthenticate(traceback.format_exc())
         issuer = token_dict['identity'].split(", ")[1].split("=")[1]

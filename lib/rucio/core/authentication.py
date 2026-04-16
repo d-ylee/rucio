@@ -479,7 +479,10 @@ def query_token(token: str, *, session: "Session") -> Optional["TokenValidationD
 
 
 @transactional_session
-def validate_auth_token(token: str, *, session: "Session") -> "TokenValidationDict":
+def validate_auth_token(token: str,
+                        *,
+                        account: Optional["InternalAccount"] = None,
+                        session: "Session") -> "TokenValidationDict":
     """
     Validate an authentication token.
 
@@ -504,13 +507,13 @@ def validate_auth_token(token: str, *, session: "Session") -> "TokenValidationDi
     value: Union[NoValue, "TokenValidationDict"] = TOKENREGION.get(cache_key)
     if value is NO_VALUE:  # no cached entry found
         value = query_token(token, session=session)
-        if not value:
+        if not value or value.get('account', None) != account:
             # identify JWT access token and validate
             # & save it in Rucio if scope and audience are correct
             if len(token.split(".")) == 3:
                 # imported here to avoid circular import
                 from rucio.core.oidc import validate_jwt
-                value = validate_jwt(token, session=session)
+                value = validate_jwt(token, account=account, session=session)
             else:
                 raise CannotAuthenticate(traceback.format_exc())
         # save token in the cache
