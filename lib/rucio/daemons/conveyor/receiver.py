@@ -169,6 +169,7 @@ def receiver(
             logging.info('setting up ssl cert/key authentication: %s' % broker)
         con = stomp.Connection12(host_and_ports=[(broker, port)],
                                  vhost=vhost,
+                                 heartbeats=(5000,0),
                                  reconnect_attempts_max=999)
         if use_ssl:
             con.set_ssl(
